@@ -20,6 +20,7 @@ from django.db.models.sql.datastructures import (
     MultiJoin)
 from django.db.models.sql.constants import *
 from django.db.models.sql.where import WhereNode, EverythingNode, AND, OR
+from django.db.models.fields.related import ReverseSingleRelatedObjectDescriptor
 
 try:
     # handle internal API changes in Django rev. 9700
@@ -583,7 +584,12 @@ class MultilingualModelQuerySet(QuerySet):
         
     def _get_all_field_names(self):
         if self._field_name_cache is None:
-            self._field_name_cache = self.model._meta.get_all_field_names() + ['pk']
+            fields = self.model._meta.get_all_field_names() + ['pk']
+            for field in fields[:]:
+                model_field = getattr(self.model, field, None)
+                if type(model_field) in (ReverseSingleRelatedObjectDescriptor,):
+                    fields.append(field + '_id')
+            self._field_name_cache = fields
         return self._field_name_cache
 
     def values(self, *fields):
