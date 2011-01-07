@@ -60,3 +60,8 @@ class CoreTestCase(TestCase):
         activate('en')
         self.assertEqual(mfp.title_current, None)
         self.assertEqual(mfp.title_current_any, mfp.title_ja)
+
+    def test_09_no_extra_query(self):
+        with self.assertNumQueries(1):
+            m = MultilingualFlatPage.objects.get(pk=1)
+            unicode(m) # access a translated field
