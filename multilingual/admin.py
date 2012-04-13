@@ -294,7 +294,7 @@ class MultilingualModelAdmin(admin.ModelAdmin):
     
     def get_form(self, request, obj=None, **kwargs):    
         # assign language to inlines, so they now how to render
-        for inline in self.inline_instances:
+        for inline in self.get_inline_instances(request):
             if isinstance(inline, MultilingualInlineAdmin):
                 inline.use_language = GLL.language_code
         
