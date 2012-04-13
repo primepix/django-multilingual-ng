@@ -78,7 +78,7 @@ class MultilingualQuery(Query):
         return super(MultilingualQuery, self).clone(klass=klass, **defaults)
 
     def add_filter(self, filter_expr, connector=AND, negate=False, trim=False,
-            can_reuse=None, process_extras=True):
+            can_reuse=None, process_extras=True, force_having=False):
         """
         Copied from add_filter to generate WHERES for translation fields.
         """
@@ -93,6 +93,10 @@ class MultilingualQuery(Query):
         else:
             lookup_type = parts.pop()
 
+        # By default, this is a WHERE clause. If an aggregate is referenced
+        # in the value, the filter will be promoted to a HAVING
+        having_clause = False
+
         # Interpret '__exact=None' as the sql 'is NULL'; otherwise, reject all
         # uses of None as a query value.
         if value is None:
@@ -100,12 +104,21 @@ class MultilingualQuery(Query):
                 raise ValueError("Cannot use None as a query value")
             lookup_type = 'isnull'
             value = True
-        elif (value == '' and lookup_type == 'exact' and
-              self.get_compiler(DEFAULT_DB_ALIAS).connection.features.interprets_empty_strings_as_nulls):
-            lookup_type = 'isnull'
-            value = True
         elif callable(value):
             value = value()
+        elif hasattr(value, 'evaluate'):
+            # If value is a query expression, evaluate it
+            value = SQLEvaluator(value, self)
+            having_clause = value.contains_aggregate
+
+        if parts[0] in self.aggregates:
+            aggregate = self.aggregates[parts[0]]
+            entry = self.where_class()
+            entry.add((aggregate, lookup_type, value), AND)
+            if negate:
+                entry.negate()
+            self.having.add(entry, connector)
+            return
 
         opts = self.get_meta()
         alias = self.get_initial_alias()
@@ -119,10 +132,11 @@ class MultilingualQuery(Query):
             self.split_exclude(filter_expr, LOOKUP_SEP.join(parts[:e.level]),
                     can_reuse)
             return
-
+            
         #=======================================================================
         # Django Mulitlingual NG Specific Code START
         #=======================================================================
+            
         if hasattr(opts, 'translation_model'):
             field_name = parts[-1]
             if field_name == 'pk':
@@ -140,49 +154,21 @@ class MultilingualQuery(Query):
                     new_table = (master_table_name + "__" + trans_table_alias)
                     self.where.add(constraint_tuple(new_table, field.column, field, lookup_type, value), connector)
                     return
+                    
         #=======================================================================
         # Django Mulitlingual NG Specific Code END
         #=======================================================================
-        final = len(join_list)
-        penultimate = last.pop()
-        if penultimate == final:
-            penultimate = last.pop()
-        if trim and len(join_list) > 1:
-            extra = join_list[penultimate:]
-            join_list = join_list[:penultimate]
-            final = penultimate
-            penultimate = last.pop()
-            col = self.alias_map[extra[0]][LHS_JOIN_COL]
-            for alias in extra:
-                self.unref_alias(alias)
-        else:
-            col = target.column
-        alias = join_list[-1]
-
-        while final > 1:
-            # An optimization: if the final join is against the same column as
-            # we are comparing against, we can go back one step in the join
-            # chain and compare against the lhs of the join instead (and then
-            # repeat the optimization). The result, potentially, involves less
-            # table joins.
-            join = self.alias_map[alias]
-            if col != join[RHS_JOIN_COL]:
-                break
-            self.unref_alias(alias)
-            alias = join[LHS_ALIAS]
-            col = join[LHS_JOIN_COL]
-            join_list = join_list[:-1]
-            final -= 1
-            if final == penultimate:
-                penultimate = last.pop()
 
         if (lookup_type == 'isnull' and value is True and not negate and
-                final > 1):
-            # If the comparison is against NULL, we need to use a left outer
-            # join when connecting to the previous model. We make that
-            # adjustment here. We don't do this unless needed as it's less
-            # efficient at the database level.
-            self.promote_alias(join_list[penultimate])
+                len(join_list) > 1):
+            # If the comparison is against NULL, we may need to use some left
+            # outer joins when creating the join chain. This is only done when
+            # needed, as it's less efficient at the database level.
+            self.promote_alias_chain(join_list)
+
+        # Process the join list to see if we can remove any inner joins from
+        # the far end (fewer tables in a query is better).
+        col, alias, join_list = self.trim_joins(target, join_list, last, trim)
 
         if connector == OR:
             # Some joins may need to be promoted when adding a new filter to a
@@ -206,28 +192,40 @@ class MultilingualQuery(Query):
             self.promote_alias_chain(join_it, join_promote)
             self.promote_alias_chain(table_it, table_promote)
 
-        self.where.add(constraint_tuple(alias, col, field, lookup_type, value), connector)
+
+        if having_clause or force_having:
+            if (alias, col) not in self.group_by:
+                self.group_by.append((alias, col))
+            self.having.add((Constraint(alias, col, field), lookup_type, value),
+                connector)
+        else:
+            self.where.add((Constraint(alias, col, field), lookup_type, value),
+                connector)
 
         if negate:
             self.promote_alias_chain(join_list)
             if lookup_type != 'isnull':
-                if final > 1:
+                if len(join_list) > 1:
                     for alias in join_list:
                         if self.alias_map[alias][JOIN_TYPE] == self.LOUTER:
                             j_col = self.alias_map[alias][RHS_JOIN_COL]
                             entry = self.where_class()
-                            entry.add(constraint_tuple(alias, j_col, None, 'isnull', True), AND)
+                            entry.add(
+                                (Constraint(alias, j_col, None), 'isnull', True),
+                                AND
+                            )
                             entry.negate()
                             self.where.add(entry, AND)
                             break
-                elif not (lookup_type == 'in' and not value) and field.null:
+                if not (lookup_type == 'in'
+                            and not hasattr(value, 'as_sql')
+                            and not hasattr(value, '_as_sql')
+                            and not value) and field.null:
                     # Leaky abstraction artifact: We have to specifically
                     # exclude the "foo__in=[]" case from this handling, because
                     # it's short-circuited in the Where class.
-                    entry = self.where_class()
-                    entry.add(constraint_tuple(alias, col, None, 'isnull', True), AND)
-                    entry.negate()
-                    self.where.add(entry, AND)
+                    # We also need to handle the case where a subquery is provided
+                    self.where.add((Constraint(alias, col, None), 'isnull', False), AND)
 
         if can_reuse is not None:
             can_reuse.update(join_list)
