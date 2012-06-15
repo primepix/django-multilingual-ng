@@ -1,5 +1,5 @@
 {% extends old_template %}
-{% load i18n admin_modify adminmedia %}
+{% load i18n admin_modify static %}
 
 {% block extrahead %}
 {{ block.super }}
@@ -39,7 +39,7 @@ django.jQuery(document).ready(function(){
     margin-bottom:-1px; 
     border-color:#DDDDDD #AAAAAA #CCCCCC #DDDDDD !important; 
     border:1px;  
-    background:white url({{ ADMIN_MEDIA_URL }}img/admin/nav-bg.gif) repeat-x scroll center bottom !important;
+    background:white url({% get_static_prefix %}admin/img/nav-bg.gif) repeat-x scroll center bottom !important;
 }
 
 
