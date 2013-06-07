@@ -19,6 +19,7 @@ from django.db.models.sql.datastructures import (
     Empty,
     MultiJoin)
 from django.db.models.sql.constants import *
+from django.db.models.constants import *
 from django.db.models.sql.where import WhereNode, EverythingNode, AND, OR
 from django.db.models.fields.related import ReverseSingleRelatedObjectDescriptor
 
