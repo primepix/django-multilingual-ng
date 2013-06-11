@@ -18,10 +18,13 @@ from django.db.models.sql.datastructures import (
     EmptyResultSet,
     Empty,
     MultiJoin)
-from django.db.models.sql.constants import *
-from django.db.models.constants import *
 from django.db.models.sql.where import WhereNode, EverythingNode, AND, OR
 from django.db.models.fields.related import ReverseSingleRelatedObjectDescriptor
+try:
+    from django.db.models.constants import *
+except ImportError:
+    from django.db.models.sql.constants import *
+
 
 try:
     # handle internal API changes in Django rev. 9700
