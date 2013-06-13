@@ -293,6 +293,8 @@ class MultilingualModelAdmin(admin.ModelAdmin):
         return self.fill_check_field
     
     def get_form(self, request, obj=None, **kwargs):    
+        if not hasattr(self, 'inline_instances'):
+            self.inline_instances = self.get_inline_instances(request)
         # assign language to inlines, so they now how to render
         for inline in self.inline_instances:
             if isinstance(inline, MultilingualInlineAdmin):
