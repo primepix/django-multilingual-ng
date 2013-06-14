@@ -10,9 +10,12 @@ from copy import deepcopy
 
 from django.core.exceptions import FieldError
 from django.db import connection
+from django.db.models.expressions import ExpressionNode
 from django.db.models.fields import FieldDoesNotExist
 from django.db.models.query import QuerySet, Q
+from django.db.models.sql.expressions import SQLEvaluator
 from django.db.models.sql.query import Query
+from django.db.models.sql.constants import *
 from django.db import connections, DEFAULT_DB_ALIAS
 from django.db.models.sql.datastructures import (
     EmptyResultSet,
@@ -20,11 +23,11 @@ from django.db.models.sql.datastructures import (
     MultiJoin)
 from django.db.models.sql.where import WhereNode, EverythingNode, AND, OR
 from django.db.models.fields.related import ReverseSingleRelatedObjectDescriptor
+
 try:
     from django.db.models.constants import *
 except ImportError:
-    from django.db.models.sql.constants import *
-
+    pass
 
 try:
     # handle internal API changes in Django rev. 9700
@@ -91,11 +94,31 @@ class MultilingualQuery(Query):
         if not parts:
             raise FieldError("Cannot parse keyword query %r" % arg)
 
-        # Work out the lookup type and remove it from 'parts', if necessary.
-        if len(parts) == 1 or parts[-1] not in self.query_terms:
-            lookup_type = 'exact'
-        else:
-            lookup_type = parts.pop()
+        # Work out the lookup type and remove it from the end of 'parts',
+        # if necessary.
+        lookup_type = 'exact' # Default lookup type
+        num_parts = len(parts)
+        if (len(parts) > 1 and parts[-1] in self.query_terms
+            and arg not in self.aggregates):
+            # Traverse the lookup query to distinguish related fields from
+            # lookup types.
+            lookup_model = self.model
+            for counter, field_name in enumerate(parts):
+                try:
+                    lookup_field = lookup_model._meta.get_field(field_name)
+                except FieldDoesNotExist:
+                    # Not a field. Bail out.
+                    lookup_type = parts.pop()
+                    break
+                # Unless we're at the end of the list of lookups, let's attempt
+                # to continue traversing relations.
+                if (counter + 1) < num_parts:
+                    try:
+                        lookup_model = lookup_field.rel.to
+                    except AttributeError:
+                        # Not a related field. Bail out.
+                        lookup_type = parts.pop()
+                        break
 
         # By default, this is a WHERE clause. If an aggregate is referenced
         # in the value, the filter will be promoted to a HAVING
@@ -110,19 +133,26 @@ class MultilingualQuery(Query):
             value = True
         elif callable(value):
             value = value()
-        elif hasattr(value, 'evaluate'):
+        elif isinstance(value, ExpressionNode):
             # If value is a query expression, evaluate it
-            value = SQLEvaluator(value, self)
+            value = SQLEvaluator(value, self, reuse=can_reuse)
             having_clause = value.contains_aggregate
-
-        if parts[0] in self.aggregates:
-            aggregate = self.aggregates[parts[0]]
-            entry = self.where_class()
-            entry.add((aggregate, lookup_type, value), AND)
-            if negate:
-                entry.negate()
-            self.having.add(entry, connector)
-            return
+        # For Oracle '' is equivalent to null. The check needs to be done
+        # at this stage because join promotion can't be done at compiler
+        # stage. Using DEFAULT_DB_ALIAS isn't nice, but it is the best we
+        # can do here. Similar thing is done in is_nullable(), too.
+        if (connections[DEFAULT_DB_ALIAS].features.interprets_empty_strings_as_nulls and
+                lookup_type == 'exact' and value == ''):
+            value = True
+            lookup_type = 'isnull'
+        for alias, aggregate in self.aggregates.items():
+            if alias in (parts[0], LOOKUP_SEP.join(parts)):
+                entry = self.where_class()
+                entry.add((aggregate, lookup_type, value), AND)
+                if negate:
+                    entry.negate()
+                self.having.add(entry, connector)
+                return
 
         opts = self.get_meta()
         alias = self.get_initial_alias()
@@ -130,12 +160,16 @@ class MultilingualQuery(Query):
 
         try:
             field, target, opts, join_list, last, extra_filters = self.setup_joins(
-                    parts, opts, alias, True, allow_many, can_reuse=can_reuse,
-                    negate=negate, process_extras=process_extras)
-        except MultiJoin, e:
+                    parts, opts, alias, True, allow_many, allow_explicit_fk=True,
+                    can_reuse=can_reuse, negate=negate,
+                    process_extras=process_extras)
+        except MultiJoin as e:
             self.split_exclude(filter_expr, LOOKUP_SEP.join(parts[:e.level]),
                     can_reuse)
             return
+
+        table_promote = False
+        join_promote = False
             
         #=======================================================================
         # Django Mulitlingual NG Specific Code START
@@ -168,11 +202,14 @@ class MultilingualQuery(Query):
             # If the comparison is against NULL, we may need to use some left
             # outer joins when creating the join chain. This is only done when
             # needed, as it's less efficient at the database level.
-            self.promote_alias_chain(join_list)
+            self.promote_joins(join_list)
+            join_promote = True
 
         # Process the join list to see if we can remove any inner joins from
         # the far end (fewer tables in a query is better).
-        col, alias, join_list = self.trim_joins(target, join_list, last, trim)
+        nonnull_comparison = (lookup_type == 'isnull' and value is False)
+        col, alias, join_list = self.trim_joins(target, join_list, last, trim,
+                nonnull_comparison)
 
         if connector == OR:
             # Some joins may need to be promoted when adding a new filter to a
@@ -182,20 +219,30 @@ class MultilingualQuery(Query):
             # join list) an outer join.
             join_it = iter(join_list)
             table_it = iter(self.tables)
-            join_it.next(), table_it.next()
-            table_promote = False
-            join_promote = False
+            next(join_it), next(table_it)
+            unconditional = False
             for join in join_it:
-                table = table_it.next()
+                table = next(table_it)
+                # Once we hit an outer join, all subsequent joins must
+                # also be promoted, regardless of whether they have been
+                # promoted as a result of this pass through the tables.
+                unconditional = (unconditional or
+                    self.alias_map[join].join_type == self.LOUTER)
                 if join == table and self.alias_refcount[join] > 1:
+                    # We have more than one reference to this join table.
+                    # This means that we are dealing with two different query
+                    # subtrees, so we don't need to do any join promotion.
                     continue
-                join_promote = self.promote_alias(join)
+                join_promote = join_promote or self.promote_joins([join], unconditional)
                 if table != join:
-                    table_promote = self.promote_alias(table)
+                    table_promote = self.promote_joins([table])
+                # We only get here if we have found a table that exists
+                # in the join list, but isn't on the original tables list.
+                # This means we've reached the point where we only have
+                # new tables, so we can break out of this promotion loop.
                 break
-            self.promote_alias_chain(join_it, join_promote)
-            self.promote_alias_chain(table_it, table_promote)
-
+            self.promote_joins(join_it, join_promote)
+            self.promote_joins(table_it, table_promote or join_promote)
 
         if having_clause or force_having:
             if (alias, col) not in self.group_by:
@@ -207,28 +254,32 @@ class MultilingualQuery(Query):
                 connector)
 
         if negate:
-            self.promote_alias_chain(join_list)
+            self.promote_joins(join_list)
             if lookup_type != 'isnull':
                 if len(join_list) > 1:
-                    for alias in join_list:
-                        if self.alias_map[alias][JOIN_TYPE] == self.LOUTER:
-                            j_col = self.alias_map[alias][RHS_JOIN_COL]
+                    for j_alias in join_list:
+                        if self.alias_map[j_alias].join_type == self.LOUTER:
+                            j_col = self.alias_map[j_alias].rhs_join_col
+                            # The join promotion logic should never produce
+                            # a LOUTER join for the base join - assert that.
+                            assert j_col is not None
                             entry = self.where_class()
                             entry.add(
-                                (Constraint(alias, j_col, None), 'isnull', True),
+                                (Constraint(j_alias, j_col, None), 'isnull', True),
                                 AND
                             )
                             entry.negate()
                             self.where.add(entry, AND)
                             break
-                if not (lookup_type == 'in'
-                            and not hasattr(value, 'as_sql')
-                            and not hasattr(value, '_as_sql')
-                            and not value) and field.null:
-                    # Leaky abstraction artifact: We have to specifically
-                    # exclude the "foo__in=[]" case from this handling, because
-                    # it's short-circuited in the Where class.
-                    # We also need to handle the case where a subquery is provided
+                if self.is_nullable(field):
+                    # In SQL NULL = anyvalue returns unknown, and NOT unknown
+                    # is still unknown. However, in Python None = anyvalue is False
+                    # (and not False is True...), and we want to return this Python's
+                    # view of None handling. So we need to specifically exclude the
+                    # NULL values, and because we are inside NOT branch they will
+                    # be included in the final resultset. We are essentially creating
+                    # SQL like this here: NOT (col IS NOT NULL), where the first NOT
+                    # is added in upper layers of the code.
                     self.where.add((Constraint(alias, col, None), 'isnull', False), AND)
 
         if can_reuse is not None:
