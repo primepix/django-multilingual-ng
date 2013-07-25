@@ -1,4 +1,4 @@
-from django.conf.urls.defaults import *
+from django.conf.urls import *
 
 urlpatterns = patterns('multilingual.flatpages.views',
     (r'^(?P<url>.*)$', 'multilingual_flatpage'),
