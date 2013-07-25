@@ -10,5 +10,5 @@ def multilingual(request):
     codes = sorted(get_language_code_list())
     return {'LANGUAGE_CODES': codes,
             'LANGUAGE_CODES_AND_NAMES': [(c, LANG_DICT.get(c, c)) for c in codes], 
-            'DEFAULT_LANGUAGE_CODE': get_default_language_code(),
-            'ADMIN_MEDIA_URL': settings.ADMIN_MEDIA_PREFIX}
+            'ADMIN_MEDIA_URL': '%s%s' % (settings.STATIC_URL, 'admin'),
+            'DEFAULT_LANGUAGE_CODE': get_default_language_code()}
