@@ -304,7 +304,7 @@ class MultilingualModelAdmin(admin.ModelAdmin):
         
         Form.ml_fields = {}
         for name, field in get_default_translated_fields(self.model):
-            if not field.editable or name in Form._meta.exclude:
+            if not field.editable or (Form._meta.exclude and (name in Form._meta.exclude)):
                 continue
             form_field = self.formfield_for_dbfield(field, request=request)
             local_name = "%s_%s" % (name, GLL.language_code)
